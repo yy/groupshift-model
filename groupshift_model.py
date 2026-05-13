@@ -133,7 +133,7 @@ def vectorized_node_sampling(P, set1_indices, set2_indices, is_in_set1, X, Y):
     """
     Returns:
         members: list of length N
-            each entry = [ingroup_samples, outgroup_samples]
+            each entry = [group0_samples, group1_samples]
     """
     N, M = P.shape
 
@@ -147,29 +147,29 @@ def vectorized_node_sampling(P, set1_indices, set2_indices, is_in_set1, X, Y):
 
     members = []
 
+    def top_k_indices(scores, requested_size):
+        sample_size = min(int(requested_size), len(scores))
+        if sample_size <= 0:
+            return np.array([], dtype=int)
+        kth = sample_size - 1
+        return np.argpartition(-scores, kth)[:sample_size]
+
     for i in range(N):
         if is_in_set1[i]:
-            # ingroup = set1
-            own_scores = scores_s1[i]
-            other_scores = scores_s2[i]
-
-            own_idx = np.argpartition(-own_scores, X)[:X]
-            other_idx = np.argpartition(-other_scores, Y)[:Y]
-
-            own = set1_indices[own_idx]
-            other = set2_indices[other_idx]
+            # group 0 is ingroup, group 1 is outgroup
+            set1_sample_size = X
+            set2_sample_size = Y
         else:
-            # ingroup = set2
-            own_scores = scores_s2[i]
-            other_scores = scores_s1[i]
+            # group 0 is outgroup, group 1 is ingroup
+            set1_sample_size = Y
+            set2_sample_size = X
 
-            own_idx = np.argpartition(-own_scores, X)[:X]
-            other_idx = np.argpartition(-other_scores, Y)[:Y]
+        set1_idx = top_k_indices(scores_s1[i], set1_sample_size)
+        set2_idx = top_k_indices(scores_s2[i], set2_sample_size)
 
-            own = set2_indices[own_idx]
-            other = set1_indices[other_idx]
-
-        members.append([own, other])
+        # Keep scope entries in group-id order because GLEAN enumerates them as
+        # perception group ids.
+        members.append([set1_indices[set1_idx], set2_indices[set2_idx]])
 
     return members
 
