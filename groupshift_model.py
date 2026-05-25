@@ -280,7 +280,7 @@ class LagMean(MechanicBase):
             relevant_scope = scope[
                 i
             ]  # Get the scope array associated with the node being affected
-            effects = G[node_idx, :, :, t - 1]  # (G , dims) matrix
+            effects = G[node_idx, :, :, t - 1].copy()  # (G , dims) matrix
             for g, members_idx in enumerate(relevant_scope):
                 if (
                     len(members_idx) <= 0

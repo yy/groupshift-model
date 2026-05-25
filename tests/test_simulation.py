@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from groupshift_model import DoNothing, GroupshiftSim, IngroupOnly, Repulse
+from groupshift_model import DoNothing, GroupshiftSim, IngroupOnly, LagMean, Repulse
 
 
 class SimulationTests(unittest.TestCase):
@@ -41,6 +41,26 @@ class SimulationTests(unittest.TestCase):
             duplicated.G[0, :, 0, 1],
             single.G[0, :, 0, 1],
         )
+
+    def test_lagmean_does_not_rewrite_previous_timestep(self):
+        G = np.zeros((1, 2, 1, 2))
+        G[0, :, :, 0] = np.array([[[10.0], [20.0]]])
+        N = np.array([[100.0], [0.0]])
+        N_adj = np.array([[0, 0], [0, 0]])
+        previous = G[0, :, :, 0].copy()
+        scope = [[np.array([0, 1]), np.array([], dtype=int)]]
+
+        LagMean(reluctance=0.5).apply(
+            G,
+            N,
+            N_adj,
+            affected_nodes=np.array([0]),
+            t=1,
+            scope=scope,
+        )
+
+        np.testing.assert_allclose(G[0, :, :, 0], previous)
+        np.testing.assert_allclose(G[0, :, :, 1], np.array([[30.0], [20.0]]))
 
 
 if __name__ == "__main__":
