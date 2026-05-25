@@ -1,13 +1,12 @@
 import numpy as np
 import pickle
 
-import pandas as pd
 import warnings
-import os
 
-#===============================================================================
+# ===============================================================================
 # Mechanics
-#===============================================================================
+# ===============================================================================
+
 
 class MechanicBase:
     def __init__(self):
@@ -24,9 +23,11 @@ class DoNothing(MechanicBase):
     def apply(self, *args, **kwargs):
         pass
 
-#----------------------------------------------------------
+
+# ----------------------------------------------------------
 # SCOPE mechanics
-#----------------------------------------------------------
+# ----------------------------------------------------------
+
 
 class IngroupOnly(MechanicBase):
     def __init__(self):
@@ -42,17 +43,21 @@ class IngroupOnly(MechanicBase):
                 # Get the group the node is in at time t
                 g = int(N_adj[node_idx, t])
 
-                if g==gi:
+                if g == gi:
                     # Get all members of the group that the node belongs to
                     members_idx = np.where(N_adj[:, t] == g)[0]
                 else:
                     members_idx = np.array([])
 
                 if not isinstance(members_idx, np.ndarray):
-                    warnings.warn("Array of members selected for scoping is not a NumPy array.", UserWarning)
+                    warnings.warn(
+                        "Array of members selected for scoping is not a NumPy array.",
+                        UserWarning,
+                    )
                 members_by_group.append(members_idx)
             members.append(members_by_group)
         return members
+
 
 # class AsymmetricSampleOriginal(MechanicBase):
 #     def __init__(self, ingroup_sample_size, outgroup_sample_size, sample_type):
@@ -123,17 +128,18 @@ class IngroupOnly(MechanicBase):
 #             members.append(members_by_group)
 #         return members
 
-def vectorized_node_sampling(P, set1_indices, set2_indices, is_in_set1, X, Y):
+
+def vectorized_node_sampling(P, group_index_sets, node_groups, X, Y):
     # Gumbel-max trick function
-    # Purpose: This function uses the Gumbel-max trick to randomly sample nodes in bulk. 
-    # This function is basically for choosing a number of ingroup and outgroup members per node 
-    # where each node's sampling is independent with a different weighted probability, P_x, 
-    # without replacement. Instead of running np.random.choice() for each node x group, which is very slow, 
-    # we can use the Gumbel-max trick to randomly generate values in bulk. 
+    # Purpose: This function uses the Gumbel-max trick to randomly sample nodes in bulk.
+    # This function is basically for choosing a number of ingroup and outgroup members per node
+    # where each node's sampling is independent with a different weighted probability, P_x,
+    # without replacement. Instead of running np.random.choice() for each node x group, which is very slow,
+    # we can use the Gumbel-max trick to randomly generate values in bulk.
     """
     Returns:
         members: list of length N
-            each entry = [ingroup_samples, outgroup_samples]
+            each entry contains one sampled-member array per group id
     """
     N, M = P.shape
 
@@ -141,35 +147,25 @@ def vectorized_node_sampling(P, set1_indices, set2_indices, is_in_set1, X, Y):
     noise = -np.log(-np.log(np.random.uniform(0, 1, size=(N, M))))
     scores = np.log(P + 1e-20) + noise
 
-    # Split scores
-    scores_s1 = scores[:, set1_indices]
-    scores_s2 = scores[:, set2_indices]
-
     members = []
 
+    def top_k_indices(scores, requested_size):
+        sample_size = min(int(requested_size), len(scores))
+        if sample_size <= 0:
+            return np.array([], dtype=int)
+        kth = sample_size - 1
+        return np.argpartition(-scores, kth)[:sample_size]
+
     for i in range(N):
-        if is_in_set1[i]:
-            # ingroup = set1
-            own_scores = scores_s1[i]
-            other_scores = scores_s2[i]
-
-            own_idx = np.argpartition(-own_scores, X)[:X]
-            other_idx = np.argpartition(-other_scores, Y)[:Y]
-
-            own = set1_indices[own_idx]
-            other = set2_indices[other_idx]
-        else:
-            # ingroup = set2
-            own_scores = scores_s2[i]
-            other_scores = scores_s1[i]
-
-            own_idx = np.argpartition(-own_scores, X)[:X]
-            other_idx = np.argpartition(-other_scores, Y)[:Y]
-
-            own = set2_indices[own_idx]
-            other = set1_indices[other_idx]
-
-        members.append([own, other])
+        # Keep scope entries in group-id order because GLEAN enumerates them as
+        # perception group ids.
+        members_by_group = []
+        for group_id, group_indices in enumerate(group_index_sets):
+            sample_size = X if node_groups[i] == group_id else Y
+            group_scores = scores[i, group_indices]
+            group_sample_idx = top_k_indices(group_scores, sample_size)
+            members_by_group.append(group_indices[group_sample_idx])
+        members.append(members_by_group)
 
     return members
 
@@ -178,7 +174,7 @@ class AsymmetricSample(MechanicBase):
     def __init__(self, ingroup_sample_size, outgroup_sample_size, sample_type):
         self.ingroupSS = ingroup_sample_size
         self.outgroupSS = outgroup_sample_size
-        self.sample_type = sample_type # "random", "extremity", "proximity"
+        self.sample_type = sample_type  # "random", "extremity", "proximity"
         self.name = "asymmetricsample"
 
     def apply(self, G, N, N_adj, affected_nodes, t):
@@ -186,8 +182,9 @@ class AsymmetricSample(MechanicBase):
         _, num_groups, _, _ = G.shape
 
         group_ids = N_adj[:, t]
-        set1_indices = np.where(group_ids == 0)[0]
-        set2_indices = np.where(group_ids == 1)[0]
+        group_index_sets = [
+            np.where(group_ids == group_id)[0] for group_id in range(num_groups)
+        ]
 
         opinions = N.mean(axis=1)
 
@@ -233,14 +230,21 @@ class AsymmetricSample(MechanicBase):
             raise ValueError(f"Sample type {self.sample_type} not recognized.")
 
         node_groups = group_ids[affected_nodes]
-        is_in_set1 = (node_groups == 0)
 
-        members = vectorized_node_sampling( P, set1_indices, set2_indices, is_in_set1, self.ingroupSS, self.outgroupSS )
+        members = vectorized_node_sampling(
+            P,
+            group_index_sets,
+            node_groups,
+            self.ingroupSS,
+            self.outgroupSS,
+        )
         return members
 
-#----------------------------------------------------------
+
+# ----------------------------------------------------------
 # GLEAN mechanics
-#----------------------------------------------------------
+# ----------------------------------------------------------
+
 
 class TakeMean(MechanicBase):
     def __init__(self):
@@ -249,15 +253,22 @@ class TakeMean(MechanicBase):
 
     def apply(self, G, N, N_adj, affected_nodes, t, scope):
         for i, node_idx in enumerate(affected_nodes):
-            relevant_scope = scope[i] #Get the scope array associated with the node being affected
-            effects = np.zeros_like(G[node_idx, :, :, t]) # (G , dims) matrix
+            relevant_scope = scope[
+                i
+            ]  # Get the scope array associated with the node being affected
+            effects = np.zeros_like(G[node_idx, :, :, t])  # (G , dims) matrix
             for g, members_idx in enumerate(relevant_scope):
                 if len(members_idx) <= 0:
-                    effects[g] = G[node_idx, g, :, t-1] # Maintain previous perception
+                    effects[g] = G[
+                        node_idx, g, :, t - 1
+                    ]  # Maintain previous perception
                 else:
                     membervalences = N[members_idx]
-                    effects[g] = np.mean(membervalences, axis=0) #Sum over dimensions of the sample
+                    effects[g] = np.mean(
+                        membervalences, axis=0
+                    )  # Sum over dimensions of the sample
             G[node_idx, :, :, t] = effects
+
 
 class LagMean(MechanicBase):
     def __init__(self, reluctance):
@@ -266,18 +277,25 @@ class LagMean(MechanicBase):
 
     def apply(self, G, N, N_adj, affected_nodes, t, scope):
         for i, node_idx in enumerate(affected_nodes):
-            relevant_scope = scope[i] #Get the scope array associated with the node being affected
-            effects = G[node_idx, :, :, t-1] # (G , dims) matrix
+            relevant_scope = scope[
+                i
+            ]  # Get the scope array associated with the node being affected
+            effects = G[node_idx, :, :, t - 1].copy()  # (G , dims) matrix
             for g, members_idx in enumerate(relevant_scope):
-                if len(members_idx) <= 0: #Skipping over cases where members_idx is blank, i.e. IngroupOnly()
+                if (
+                    len(members_idx) <= 0
+                ):  # Skipping over cases where members_idx is blank, i.e. IngroupOnly()
                     continue
                 membervalences = N[members_idx]
-                newmean = np.mean(membervalences, axis=0) #Get next mean
-                effects[g,:] = effects[g,:] + self.reluctance * (newmean - effects[g,:])
+                newmean = np.mean(membervalences, axis=0)  # Get next mean
+                effects[g, :] = effects[g, :] + self.reluctance * (
+                    newmean - effects[g, :]
+                )
             G[node_idx, :, :, t] = effects
 
+
 class Attract(MechanicBase):
-    def __init__(self, aWidth, aAmp, normalize = False):
+    def __init__(self, aWidth, aAmp, normalize=False):
         self.aWidth = aWidth
         self.aAmp = aAmp
         self.normalize = normalize
@@ -285,24 +303,33 @@ class Attract(MechanicBase):
 
     def apply(self, G, N, N_adj, affected_nodes, t, scope):
         for i, node_idx in enumerate(affected_nodes):
-            relevant_scope = scope[i] #Get the scope array associated with the node being affected
-            effects = np.zeros_like(G[node_idx, :, :, t]) #(G, dims)
+            relevant_scope = scope[
+                i
+            ]  # Get the scope array associated with the node being affected
+            effects = np.zeros_like(G[node_idx, :, :, t])  # (G, dims)
             for g, members_idx in enumerate(relevant_scope):
                 if len(members_idx) == 0:
-                    effects[g] = G[node_idx, g, :, t-1]
+                    effects[g] = G[node_idx, g, :, t - 1]
                 else:
                     membervalences = N[members_idx]
-                    op = G[node_idx, g, :, t-1]
+                    op = G[node_idx, g, :, t - 1]
                     pointing = membervalences - op
                     distance = np.abs(membervalences - op)
-                    delta_op = pointing * self.aAmp * np.exp(-1 * (1/self.aWidth) * distance)
+                    delta_op = (
+                        pointing * self.aAmp * np.exp(-1 * (1 / self.aWidth) * distance)
+                    )
                     if self.normalize:
-                        delta_op = delta_op * (1/len(members_idx))
-                    effects[g] = G[node_idx, g, :, t-1] + delta_op.sum(axis=0) #Sums over dims
+                        delta_op = delta_op * (1 / len(members_idx))
+                    effects[g] = G[node_idx, g, :, t - 1] + delta_op.sum(
+                        axis=0
+                    )  # Sums over dims
             G[node_idx, :, :, t] = effects
-#----------------------------------------------------------
+
+
+# ----------------------------------------------------------
 # SHIFT mechanics
-#----------------------------------------------------------
+# ----------------------------------------------------------
+
 
 class Repulse(MechanicBase):
     def __init__(self, rWidth, rAmp):
@@ -315,17 +342,22 @@ class Repulse(MechanicBase):
             effects = np.zeros_like(G[node_idx, :, :, t])
             for g1 in range(num_groups):
                 # Calculate repulsion from all other groups based on the previous group's opinion
-                op = G[node_idx, g1, :, t-1]
+                op = G[node_idx, g1, :, t - 1]
                 aggregated_delta = np.zeros(op.shape)
 
                 for g2 in range(num_groups):
                     if g1 != g2:  # We don't want self-repulsion
-                        pointing = -(G[node_idx, g2, :, t-1] - op)
-                        distance = np.abs(G[node_idx, g2, :, t-1] - op)
-                        delta_op = pointing * self.rAmp * np.exp(-1 * (1/self.rWidth) * distance)
+                        pointing = -(G[node_idx, g2, :, t - 1] - op)
+                        distance = np.abs(G[node_idx, g2, :, t - 1] - op)
+                        delta_op = (
+                            pointing
+                            * self.rAmp
+                            * np.exp(-1 * (1 / self.rWidth) * distance)
+                        )
                         aggregated_delta += delta_op
                 effects[g1] = aggregated_delta
             G[node_idx, :, :, t] = G[node_idx, :, :, t] + effects
+
 
 class RepulseSpecific(MechanicBase):
     def __init__(self, rWidth):
@@ -335,20 +367,40 @@ class RepulseSpecific(MechanicBase):
         raise ValueError("This mechanic is not yet implemented.")
         pass
 
-#=============================================================================================================================================
+
+# =============================================================================================================================================
 # Simulation class
-#=============================================================================================================================================
-class GroupshiftSim():
-    def __init__(self, G, N, N_adj, C, num_nodes, dims, num_groups, timesteps, opinion_range, simnum, temp, init_method, SCOPE, GLEAN, SHIFT, folder = None, filename = None):
+# =============================================================================================================================================
+class GroupshiftSim:
+    def __init__(
+        self,
+        G,
+        N,
+        N_adj,
+        C,
+        num_nodes,
+        dims,
+        num_groups,
+        timesteps,
+        opinion_range,
+        simnum,
+        temp,
+        init_method,
+        SCOPE,
+        GLEAN,
+        SHIFT,
+        folder=None,
+        filename=None,
+    ):
         # This function assumes the following shapes:
         # N = np.random.uniform(0, 100, size=(num_nodes, dims))    #   Node opinion matrix
         # N_adj = np.zeros((num_nodes, timesteps))    #   N_adj matrix
         # G = np.zeros((num_nodes, num_groups, dims, timesteps)) # Group matrix, with each node having a group perception
 
-        self.G = G                                                              # Group perception matrix
-        self.N = N                                                              # Node opinion matrix
-        self.N_adj = N_adj                                                      # Node affiliation matrix
-        self.C = C                                                              # Affected nodes per timestep
+        self.G = G  # Group perception matrix
+        self.N = N  # Node opinion matrix
+        self.N_adj = N_adj  # Node affiliation matrix
+        self.C = C  # Affected nodes per timestep
         self.lowvalence = opinion_range[0]
         self.highvalence = opinion_range[1]
         self.SCOPE = SCOPE
@@ -366,65 +418,85 @@ class GroupshiftSim():
         self.num_groups = num_groups
         self.timesteps = timesteps
 
-        #Pull out num_nodes, num_groups, and dims from the arrays
-        #self.num_nodes, self.dims = N.shape
-        #_, self.num_groups, _, self.timesteps = G.shape
+        # Pull out num_nodes, num_groups, and dims from the arrays
+        # self.num_nodes, self.dims = N.shape
+        # _, self.num_groups, _, self.timesteps = G.shape
 
-    def initializeSim(self, seed = None):
+    def initializeSim(self, seed=None):
         if seed is None:
-            #seed = int(f"{os.getpid()}{self.simnum}")
+            # seed = int(f"{os.getpid()}{self.simnum}")
             seed = self.simnum
         np.random.seed(seed)
 
         # Create N, the node opinion vector. Shape: [node opinion, dimension]
-        self.N = np.random.uniform(self.lowvalence, self.highvalence, size=(self.num_nodes, self.dims))
+        self.N = np.random.uniform(
+            self.lowvalence, self.highvalence, size=(self.num_nodes, self.dims)
+        )
 
         # Create N_adj, the node group affiliation matrix. Shape: [node affiliation, timestep]
         self.N_adj = np.zeros((self.num_nodes, self.timesteps))
-        self.N_adj[:,0] = np.random.randint(0,self.num_groups,size=(self.num_nodes))
+        self.N_adj[:, 0] = np.random.randint(0, self.num_groups, size=(self.num_nodes))
 
         # Create G, the group perception matrix. Shape: [node id, group id, dimension, perception at timestep]
         # G allows for different initialization methods for testing purposes
         if self.init_method == "initmeans":
             # ------ Initialize first perception values as the mean of node opinions in each group
-            self.G = np.zeros((self.num_nodes, self.num_groups, self.dims, self.timesteps))
+            self.G = np.zeros(
+                (self.num_nodes, self.num_groups, self.dims, self.timesteps)
+            )
             sums = np.zeros((self.num_groups, self.dims))
             np.add.at(sums, self.N_adj[:, 0].astype(int), self.N)
-            counts = np.bincount(self.N_adj[:, 0].astype(int), minlength=self.num_groups)  # Calculate the number of nodes in each group
-            counts[counts == 0] = 1  # Avoid division by zero by replacing zero counts with one (the corresponding sums are zero, so the division result will still be zero)
-            mean_values = sums / counts[:, np.newaxis] # Calculate the mean of node values for each group
-            self.G[:, :, :, 0] = np.tile(mean_values, (self.num_nodes, 1, 1)).reshape(self.num_nodes, self.num_groups, self.dims)
+            counts = np.bincount(
+                self.N_adj[:, 0].astype(int), minlength=self.num_groups
+            )  # Calculate the number of nodes in each group
+            counts[counts == 0] = (
+                1  # Avoid division by zero by replacing zero counts with one (the corresponding sums are zero, so the division result will still be zero)
+            )
+            mean_values = (
+                sums / counts[:, np.newaxis]
+            )  # Calculate the mean of node values for each group
+            self.G[:, :, :, 0] = np.tile(mean_values, (self.num_nodes, 1, 1)).reshape(
+                self.num_nodes, self.num_groups, self.dims
+            )
         elif self.init_method == "initrand":
             # ------ Initialize first perception values randomly
             # Create G, the group perception matrix. Shape: [node id, group id, dimension, perception at timestep]
-            self.G = np.zeros((self.num_nodes, self.num_groups, self.dims, self.timesteps))
-            self.G[:, :, :, 0] = np.random.uniform(self.lowvalence, self.highvalence, size=(self.num_nodes, self.num_groups, self.dims))
+            self.G = np.zeros(
+                (self.num_nodes, self.num_groups, self.dims, self.timesteps)
+            )
+            self.G[:, :, :, 0] = np.random.uniform(
+                self.lowvalence,
+                self.highvalence,
+                size=(self.num_nodes, self.num_groups, self.dims),
+            )
         elif self.init_method == "initgauss":
             # ------ Initialize the first perception values
             # Create G
-            mu = np.array([46, 54])      # mean perception for group 0 and 1
-            sigma = 10                  # or whatever spread you want
+            mu = np.array([46, 54])  # mean perception for group 0 and 1
+            sigma = 10  # or whatever spread you want
 
-            self.G = np.zeros((self.num_nodes, self.num_groups, self.dims, self.timesteps))
+            self.G = np.zeros(
+                (self.num_nodes, self.num_groups, self.dims, self.timesteps)
+            )
 
             for g in range(self.num_groups):
                 self.G[:, g, :, 0] = np.random.normal(
-                    loc=mu[g],
-                    scale=sigma,
-                    size=(self.num_nodes, self.dims)
+                    loc=mu[g], scale=sigma, size=(self.num_nodes, self.dims)
                 )
         else:
-            raise ValueError(f"Simulation initialization type {self.init_method} not recognized.")
+            raise ValueError(
+                f"Simulation initialization type {self.init_method} not recognized."
+            )
 
         # >>> Create node change order
-        self.C = np.random.randint(0,self.num_nodes,size=(self.timesteps, self.temp))
+        self.C = np.random.randint(0, self.num_nodes, size=(self.timesteps, self.temp))
 
     def carryOver(self, t):
         # Take assignments from the previous timestep for all nodes
-        self.N_adj[:, t] = self.N_adj[:, t-1]
+        self.N_adj[:, t] = self.N_adj[:, t - 1]
 
-        #Carry over everyone's perceptions to the next time step
-        self.G[:,:,:,t] = self.G[:,:,:,t-1]
+        # Carry over everyone's perceptions to the next time step
+        self.G[:, :, :, t] = self.G[:, :, :, t - 1]
 
     def switch_group(self, t, affected_nodes):
         for node_idx in affected_nodes:
@@ -432,7 +504,9 @@ class GroupshiftSim():
             node_values = self.N[node_idx]
 
             # Compute distances of this node to all group centroids from the previous timestep
-            distances = np.linalg.norm(node_values - self.G[node_idx, :, :, t-1], axis=1)
+            distances = np.linalg.norm(
+                node_values - self.G[node_idx, :, :, t - 1], axis=1
+            )
 
             # Find the closest group
             closest_group = np.argmin(distances)
@@ -441,32 +515,36 @@ class GroupshiftSim():
             self.N_adj[node_idx, t] = closest_group
 
     def run_simulation(self, *mechanic_params):
-        for t in range(1,self.timesteps):
-            #Define the nodes affected this timestep
-            affected_nodes = self.C[t, :]
+        for t in range(1, self.timesteps):
+            # Define the nodes affected this timestep
+            timestep_nodes = self.C[t, :]
+            _, first_indices = np.unique(timestep_nodes, return_index=True)
+            affected_nodes = timestep_nodes[np.sort(first_indices)]
 
-            #Perform the carryover mechanic
+            # Perform the carryover mechanic
             self.carryOver(t)
 
-            #Perform the switch groups mechanic
+            # Perform the switch groups mechanic
             self.switch_group(t, affected_nodes)
 
             # Set the scope of the glean effects
             scope = self.SCOPE.apply(self.G, self.N, self.N_adj, affected_nodes, t)
 
-            #Perform glean mechanics
+            # Perform glean mechanics
             self.GLEAN.apply(self.G, self.N, self.N_adj, affected_nodes, t, scope)
 
-            #Perform shift mechanics
+            # Perform shift mechanics
             self.SHIFT.apply(self.G, self.N, self.N_adj, affected_nodes, t)
 
-            #Lastly, clamp the values down
+            # Lastly, clamp the values down
             for i in affected_nodes:
-                self.G[i, :, :, t] = np.clip(self.G[i, :, :, t], self.lowvalence, self.highvalence)
+                self.G[i, :, :, t] = np.clip(
+                    self.G[i, :, :, t], self.lowvalence, self.highvalence
+                )
 
-    #----------------------------------------------------------
+    # ----------------------------------------------------------
     # Non-sim functions
-    #----------------------------------------------------------
+    # ----------------------------------------------------------
 
     def plot_group_values(self):
         # Create a figure and axis
@@ -478,54 +556,60 @@ class GroupshiftSim():
 
         # For each dimension and each group
         for d in range(self.dims):
-            #perceptionlines = {}
+            # perceptionlines = {}
             for group in range(self.num_groups):
-                #Calculate mean opinions of constituents
+                # Calculate mean opinions of constituents
                 mean_opinions = []
                 for t in range(self.timesteps):
                     group_members = self.N[self.N_adj[:, t] == group]
                     mean_opinion = np.mean(group_members[:, d])
                     mean_opinions.append(mean_opinion)
-                ax[d].plot(mean_opinions, '-.', label=f'Mean Opinion Group {group}')
+                ax[d].plot(mean_opinions, "-.", label=f"Mean Opinion Group {group}")
 
                 # Calculate and plot the mean perception of the constituents for the current group over time
                 for perception_group in range(self.num_groups):
-
                     mean_perceptions = []
                     for t in range(self.timesteps):
                         # Get the members of the group
                         group_members = np.where(self.N_adj[:, t] == group)[0]
                         if len(group_members) > 0:
-                            mean_perception = np.mean(self.G[group_members, perception_group, d, t])
+                            mean_perception = np.mean(
+                                self.G[group_members, perception_group, d, t]
+                            )
                         else:
                             mean_perception = np.nan
                         mean_perceptions.append(mean_perception)
 
                     # Set line style based on whether the group is perceiving itself or another group
                     if group == perception_group:
-                        linestyle = '-'
+                        linestyle = "-"
                     else:
-                        linestyle = '--'
+                        linestyle = "--"
 
-                    ax[d].plot(mean_perceptions, label=f'Group {group} perception of Group {perception_group}', linestyle=linestyle, alpha=0.6)
-                    #perceptionlines[f'Group {group} perception of Group {perception_group}'] = mean_perceptions
+                    ax[d].plot(
+                        mean_perceptions,
+                        label=f"Group {group} perception of Group {perception_group}",
+                        linestyle=linestyle,
+                        alpha=0.6,
+                    )
+                    # perceptionlines[f'Group {group} perception of Group {perception_group}'] = mean_perceptions
 
                     # if perception_group == group:
                     #   diffs = np.array(mean_perceptions) - np.array(mean_opinions)
                     #   print( np.mean( diffs[self.timesteps - 500:] ) )
 
-            ax[d].set_title(f'Dimension {d + 1}')
-            ax[d].set_xlabel('Time')
-            ax[d].set_ylabel('Value')
-            ax[d].legend(loc='center left', bbox_to_anchor=(1, 0.5))
+            ax[d].set_title(f"Dimension {d + 1}")
+            ax[d].set_xlabel("Time")
+            ax[d].set_ylabel("Value")
+            ax[d].legend(loc="center left", bbox_to_anchor=(1, 0.5))
             ax[d].set_ylim((self.lowvalence, self.highvalence))
 
         plt.tight_layout()
         plt.show()
 
-        #return perceptionlines
+        # return perceptionlines
 
-    def plot_indiv_values(self, node_num, dim_num = 0):
+    def plot_indiv_values(self, node_num, dim_num=0):
         # Create a figure for the plot
         plt.figure(figsize=(10, 6))
 
@@ -535,13 +619,17 @@ class GroupshiftSim():
             timeseries = self.G[node_num, g, dim_num, :]
 
             # Plot the time series
-            plt.plot(timeseries, label=f'Group {g}')  # You can customize the label if necessary
+            plt.plot(
+                timeseries, label=f"Group {g}"
+            )  # You can customize the label if necessary
 
         # Add plot labels and legend
-        plt.xlabel('Time')
-        plt.ylabel(f'Perception for Node {node_num}, Dimension {dim_num}')
-        plt.title(f'Time Series of Perceptions for Node {node_num + 1} (Dimension {dim_num + 1})')
-        plt.ylim((0,100))
+        plt.xlabel("Time")
+        plt.ylabel(f"Perception for Node {node_num}, Dimension {dim_num}")
+        plt.title(
+            f"Time Series of Perceptions for Node {node_num + 1} (Dimension {dim_num + 1})"
+        )
+        plt.ylim((0, 100))
         plt.legend()
         plt.grid(True)
 
@@ -550,7 +638,7 @@ class GroupshiftSim():
 
     def pickle(self):
         if self.folder is not None and self.filename is not None:
-            with open(f'{self.folder}/{self.filename}.pkl', 'wb') as f:
+            with open(f"{self.folder}/{self.filename}.pkl", "wb") as f:
                 pickle.dump(self, f)
         else:
             raise ValueError("Folder and filename must be specified for saving.")
@@ -566,6 +654,11 @@ class GroupshiftSim():
         Compute per-group summary metrics for this simulation.
         Returns a list of dicts (one per group).
         """
+        if self.num_groups != 2:
+            raise ValueError(
+                "outputMetrics currently requires exactly two groups because "
+                "percept_outgroup_fin is defined for a single outgroup."
+            )
 
         T = self.timesteps
         end_slice = slice(T - end_window, T)
@@ -573,10 +666,9 @@ class GroupshiftSim():
         rows = []
 
         for group in range(self.num_groups):
-
             # --- membership ---
             members_init = np.where(self.N_adj[:, 0] == group)[0]
-            members_fin  = np.where(self.N_adj[:, T - 1] == group)[0]
+            members_fin = np.where(self.N_adj[:, T - 1] == group)[0]
 
             if len(members_fin) == 0:
                 continue
@@ -584,16 +676,12 @@ class GroupshiftSim():
             # --- true opinions ---
             true_vals_fin = self.N[members_fin, dim]
             true_mean = np.mean(true_vals_fin)
-            true_var  = np.var(true_vals_fin)
+            true_var = np.var(true_vals_fin)
 
             # --- perceptions ---
-            percept_init = np.mean(
-                self.G[members_init, group, dim, 0]
-            )
+            percept_init = np.mean(self.G[members_init, group, dim, 0])
 
-            percept_fin = np.mean(
-                self.G[members_fin, group, dim, end_slice]
-            )
+            percept_fin = np.mean(self.G[members_fin, group, dim, end_slice])
 
             outgroup = 1 - group
 
@@ -602,31 +690,33 @@ class GroupshiftSim():
             )
 
             # --- store ---
-            rows.append({
-                "simnum": self.simnum,
-                "init_type": self.init_method,
-                "temp": self.temp,
-                "sample_method": self.SCOPE.sample_type,
-                "aAmp": self.GLEAN.aAmp, 
-                "aWidth": self.GLEAN.aWidth,
-                "rAmp": self.SHIFT.rAmp,
-                "rWidth": self.SHIFT.rWidth,
-                "GroupID": group,
-                "true_mean": float(true_mean),
-                "true_var": float(true_var),
-                "group_size_init": int(len(members_init)),
-                "group_size_fin": int(len(members_fin)),
-                "percept_init": float(percept_init),
-                "percept_fin": float(percept_fin),
-                "percept_outgroup_fin": float(percept_outgroup_fin),
-            })
+            rows.append(
+                {
+                    "simnum": self.simnum,
+                    "init_type": self.init_method,
+                    "temp": self.temp,
+                    "sample_method": self.SCOPE.sample_type,
+                    "aAmp": self.GLEAN.aAmp,
+                    "aWidth": self.GLEAN.aWidth,
+                    "rAmp": self.SHIFT.rAmp,
+                    "rWidth": self.SHIFT.rWidth,
+                    "GroupID": group,
+                    "true_mean": float(true_mean),
+                    "true_var": float(true_var),
+                    "group_size_init": int(len(members_init)),
+                    "group_size_fin": int(len(members_fin)),
+                    "percept_init": float(percept_init),
+                    "percept_fin": float(percept_fin),
+                    "percept_outgroup_fin": float(percept_outgroup_fin),
+                }
+            )
 
         return rows
 
 
-
-if __name__ == '__main__':
-    print("This is the GroupshiftSim class. Please run groupshift_parallel.py to execute simulations.")
-else: 
+if __name__ == "__main__":
+    print(
+        "This is the GroupshiftSim class. Please run groupshift_parallel.py to execute simulations."
+    )
+else:
     from matplotlib import pyplot as plt
-    import seaborn as sns

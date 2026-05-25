@@ -14,3 +14,11 @@ In use as of 2/18/2026:
 Legacy: 
 * groupshift_mode.ipynb -- Deprecated notebook for model implemented in networkx ("slow" version)
 * groupshift_analysis2.ipynb -- Slightly outdated notebook for running bulk simulations, still useful as reference
+
+## Testing
+
+Run the test suite with:
+
+```bash
+uv run --group dev pytest -q
+```
